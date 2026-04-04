@@ -6,6 +6,7 @@ import asyncio
 import logging
 import mimetypes
 import re
+import shutil
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
@@ -14,6 +15,7 @@ import httpx
 from langgraph_sdk.errors import ConflictError
 
 from app.channels.commands import KNOWN_CHANNEL_COMMANDS
+from app.channels.inbound_uploads import stage_inbound_files
 from app.channels.message_bus import InboundMessage, InboundMessageType, MessageBus, OutboundMessage, ResolvedAttachment
 from app.channels.store import ChannelStore
 
@@ -32,12 +34,14 @@ DEFAULT_RUN_CONTEXT: dict[str, Any] = {
 }
 STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.35
 THREAD_BUSY_MESSAGE = "This conversation is already processing another request. Please wait for it to finish and try again."
+DEFAULT_TYPING_REFRESH_INTERVAL_SECONDS = 6.0
 
 CHANNEL_CAPABILITIES = {
     "feishu": {"supports_streaming": True},
     "slack": {"supports_streaming": False},
     "telegram": {"supports_streaming": False},
     "wecom": {"supports_streaming": True},
+    "wechat": {"supports_streaming": False},
 }
 
 InboundFileReader = Callable[[dict[str, Any], httpx.AsyncClient], Awaitable[bytes | None]]
@@ -170,6 +174,31 @@ def _extract_response_text(result: dict | list) -> str:
     return ""
 
 
+async def _build_run_input(thread_id: str, msg: InboundMessage) -> dict[str, Any]:
+    """Build a LangGraph input payload for a channel message.
+
+    For inbound files, mirror them into the thread uploads directory and reuse
+    the same ``additional_kwargs.files`` shape produced by the frontend upload
+    flow so UploadsMiddleware can expose them to the agent.
+    """
+    if not msg.files:
+        return {"messages": [{"role": "human", "content": msg.text}]}
+
+    uploaded_files = await stage_inbound_files(thread_id, msg.files)
+    if not uploaded_files:
+        return {"messages": [{"role": "human", "content": msg.text}]}
+
+    return {
+        "messages": [
+            {
+                "type": "human",
+                "content": [{"type": "text", "text": msg.text}],
+                "additional_kwargs": {"files": uploaded_files},
+            }
+        ]
+    }
+
+
 def _extract_text_content(content: Any) -> str:
     """Extract text from a streaming payload content field."""
     if isinstance(content, str):
@@ -295,6 +324,70 @@ def _extract_artifacts(result: dict | list) -> list[str]:
     return artifacts
 
 
+def _snapshot_outputs_dir(thread_id: str) -> dict[str, tuple[int, int]]:
+    """Capture the current outputs directory file state for a thread."""
+    from deerflow.config.paths import get_paths
+
+    outputs_dir = get_paths().sandbox_outputs_dir(thread_id)
+    if not outputs_dir.exists():
+        return {}
+
+    snapshot: dict[str, tuple[int, int]] = {}
+    for path in outputs_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            stat_result = path.stat()
+            rel_path = path.relative_to(outputs_dir).as_posix()
+        except (OSError, ValueError):
+            continue
+        snapshot[rel_path] = (stat_result.st_size, stat_result.st_mtime_ns)
+    return snapshot
+
+
+def _infer_artifacts_from_outputs_delta(
+    thread_id: str,
+    previous_snapshot: Mapping[str, tuple[int, int]] | None,
+) -> list[str]:
+    """Infer output artifacts by comparing outputs dir state before/after a run."""
+    from deerflow.config.paths import get_paths
+
+    outputs_dir = get_paths().sandbox_outputs_dir(thread_id)
+    if not outputs_dir.exists():
+        return []
+
+    previous = dict(previous_snapshot or {})
+    inferred: list[str] = []
+    for path in sorted(outputs_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            stat_result = path.stat()
+            rel_path = path.relative_to(outputs_dir).as_posix()
+        except (OSError, ValueError):
+            continue
+        current_state = (stat_result.st_size, stat_result.st_mtime_ns)
+        if previous.get(rel_path) != current_state:
+            inferred.append(f"{_OUTPUTS_VIRTUAL_PREFIX}{rel_path}")
+    return inferred
+
+
+def _collect_artifacts(
+    thread_id: str,
+    result: dict | list,
+    previous_outputs_snapshot: Mapping[str, tuple[int, int]] | None,
+) -> list[str]:
+    """Collect artifacts from explicit tool calls, then fall back to outputs delta."""
+    artifacts = _extract_artifacts(result)
+    if artifacts:
+        return artifacts
+
+    inferred = _infer_artifacts_from_outputs_delta(thread_id, previous_outputs_snapshot)
+    if inferred:
+        logger.info("[Manager] inferred artifacts from outputs delta: thread_id=%s count=%d", thread_id, len(inferred))
+    return inferred
+
+
 def _format_artifact_text(artifacts: list[str]) -> str:
     """Format artifact paths into a human-readable text block listing filenames."""
     import posixpath
@@ -306,14 +399,39 @@ def _format_artifact_text(artifacts: list[str]) -> str:
 
 
 _OUTPUTS_VIRTUAL_PREFIX = "/mnt/user-data/outputs/"
+_UPLOADS_VIRTUAL_PREFIX = "/mnt/user-data/uploads/"
+
+
+def _copy_upload_attachment_for_delivery(actual_path, outputs_dir):
+    """Copy a thread upload into outputs so channels can deliver it safely."""
+    from deerflow.uploads.manager import claim_unique_filename
+
+    source_path = actual_path.resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
+    target_dir = outputs_dir.resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    source_bytes = source_path.read_bytes()
+    if source_path.suffix.lower() in {".jpg", ".jpeg"} and source_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        source_name = f"{source_path.stem}.png"
+    elif source_path.suffix.lower() != ".webp" and len(source_bytes) >= 12 and source_bytes.startswith(b"RIFF") and source_bytes[8:12] == b"WEBP":
+        source_name = f"{source_path.stem}.webp"
+    else:
+        source_name = source_path.name
+    seen_names = {path.name for path in target_dir.iterdir() if path.is_file()}
+    dest_name = claim_unique_filename(source_name, seen_names)
+    dest_path = target_dir / dest_name
+    shutil.copy2(source_path, dest_path)
+    return dest_path
 
 
 def _resolve_attachments(thread_id: str, artifacts: list[str]) -> list[ResolvedAttachment]:
     """Resolve virtual artifact paths to host filesystem paths with metadata.
 
-    Only paths under ``/mnt/user-data/outputs/`` are accepted; any other
-    virtual path is rejected with a warning to prevent exfiltrating uploads
-    or workspace files via IM channels.
+    Paths under ``/mnt/user-data/outputs/`` are accepted directly. Paths under
+    ``/mnt/user-data/uploads/`` are copied into outputs first so channels can
+    send user-provided media back without exposing arbitrary sandbox files.
+    Any other virtual path is rejected with a warning.
 
     Skips artifacts that cannot be resolved (missing files, invalid paths)
     and logs warnings for them.
@@ -323,32 +441,44 @@ def _resolve_attachments(thread_id: str, artifacts: list[str]) -> list[ResolvedA
     attachments: list[ResolvedAttachment] = []
     paths = get_paths()
     outputs_dir = paths.sandbox_outputs_dir(thread_id).resolve()
+    uploads_dir = paths.sandbox_uploads_dir(thread_id).resolve() if hasattr(paths, "sandbox_uploads_dir") else None
     for virtual_path in artifacts:
-        # Security: only allow files from the agent outputs directory
-        if not virtual_path.startswith(_OUTPUTS_VIRTUAL_PREFIX):
+        if not virtual_path.startswith((_OUTPUTS_VIRTUAL_PREFIX, _UPLOADS_VIRTUAL_PREFIX)):
             logger.warning("[Manager] rejected non-outputs artifact path: %s", virtual_path)
             continue
         try:
             actual = paths.resolve_virtual_path(thread_id, virtual_path)
-            # Verify the resolved path is actually under the outputs directory
-            # (guards against path-traversal even after prefix check)
-            try:
-                actual.resolve().relative_to(outputs_dir)
-            except ValueError:
-                logger.warning("[Manager] artifact path escapes outputs dir: %s -> %s", virtual_path, actual)
+            resolved_actual = actual.resolve()
+            if virtual_path.startswith(_OUTPUTS_VIRTUAL_PREFIX):
+                try:
+                    resolved_actual.relative_to(outputs_dir)
+                except ValueError:
+                    logger.warning("[Manager] artifact path escapes outputs dir: %s -> %s", virtual_path, actual)
+                    continue
+                delivery_actual = resolved_actual
+            else:
+                if uploads_dir is None:
+                    logger.warning("[Manager] uploads dir unavailable for artifact path: %s", virtual_path)
+                    continue
+                try:
+                    resolved_actual.relative_to(uploads_dir)
+                except ValueError:
+                    logger.warning("[Manager] artifact path escapes uploads dir: %s -> %s", virtual_path, actual)
+                    continue
+                delivery_actual = _copy_upload_attachment_for_delivery(resolved_actual, outputs_dir)
+
+            if not delivery_actual.is_file():
+                logger.warning("[Manager] artifact not found on disk: %s -> %s", virtual_path, delivery_actual)
                 continue
-            if not actual.is_file():
-                logger.warning("[Manager] artifact not found on disk: %s -> %s", virtual_path, actual)
-                continue
-            mime, _ = mimetypes.guess_type(str(actual))
+            mime, _ = mimetypes.guess_type(str(delivery_actual))
             mime = mime or "application/octet-stream"
             attachments.append(
                 ResolvedAttachment(
                     virtual_path=virtual_path,
-                    actual_path=actual,
-                    filename=actual.name,
+                    actual_path=delivery_actual,
+                    filename=delivery_actual.name,
                     mime_type=mime,
-                    size=actual.stat().st_size,
+                    size=delivery_actual.stat().st_size,
                     is_image=mime.startswith("image/"),
                 )
             )
@@ -515,6 +645,57 @@ class ChannelManager:
         self._semaphore: asyncio.Semaphore | None = None
         self._running = False
         self._task: asyncio.Task | None = None
+        self._registered_channels: dict[str, Any] = {}
+
+    def register_channel(self, name: str, channel: Any) -> None:
+        self._registered_channels[name] = channel
+
+    def unregister_channel(self, name: str) -> None:
+        self._registered_channels.pop(name, None)
+
+    def _get_registered_channel(self, channel_name: str) -> Any | None:
+        return self._registered_channels.get(channel_name)
+
+    def _create_typing_task(self, msg: InboundMessage) -> asyncio.Task | None:
+        channel = self._get_registered_channel(msg.channel_name)
+        if channel is None:
+            return None
+
+        send_typing = getattr(channel, "send_typing", None)
+        if not callable(send_typing):
+            return None
+
+        context_token = msg.metadata.get("context_token") if isinstance(msg.metadata, dict) else None
+        if not isinstance(context_token, str) or not context_token.strip():
+            return None
+
+        refresh_interval_raw = getattr(channel, "config", {}).get("typing_refresh_interval", DEFAULT_TYPING_REFRESH_INTERVAL_SECONDS)
+        try:
+            refresh_interval = max(float(refresh_interval_raw), 0.1)
+        except (TypeError, ValueError):
+            refresh_interval = DEFAULT_TYPING_REFRESH_INTERVAL_SECONDS
+
+        async def _typing_loop() -> None:
+            while True:
+                try:
+                    await send_typing(msg.chat_id, context_token)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("[Manager] typing loop failed for channel=%s chat_id=%s", msg.channel_name, msg.chat_id)
+                    return
+                await asyncio.sleep(refresh_interval)
+
+        return asyncio.create_task(_typing_loop())
+
+    async def _cancel_typing_task(self, task: asyncio.Task | None) -> None:
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     @staticmethod
     def _channel_supports_streaming(channel_name: str) -> bool:
@@ -674,63 +855,74 @@ class ChannelManager:
         if thread_id is None:
             thread_id = await self._create_thread(client, msg)
 
-        assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
-        if extra_context:
-            run_context.update(extra_context)
+        outputs_snapshot = _snapshot_outputs_dir(thread_id)
 
-        uploaded = await _ingest_inbound_files(thread_id, msg)
-        if uploaded:
-            msg.text = f"{_format_uploaded_files_block(uploaded)}\n\n{msg.text}".strip()
+        typing_task = self._create_typing_task(msg)
 
-        if self._channel_supports_streaming(msg.channel_name):
-            await self._handle_streaming_chat(
-                client,
-                msg,
+        try:
+            assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
+            if extra_context:
+                run_context.update(extra_context)
+
+            uploaded = await _ingest_inbound_files(thread_id, msg)
+            if uploaded:
+                msg.text = f"{_format_uploaded_files_block(uploaded)}\n\n{msg.text}".strip()
+
+            if self._channel_supports_streaming(msg.channel_name):
+                run_input = await _build_run_input(thread_id, msg)
+                await self._handle_streaming_chat(
+                    client,
+                    msg,
+                    thread_id,
+                    assistant_id,
+                    run_config,
+                    run_context,
+                    run_input,
+                    outputs_snapshot,
+                )
+                return
+
+            logger.info("[Manager] invoking runs.wait(thread_id=%s, text=%r)", thread_id, msg.text[:100])
+            run_input = await _build_run_input(thread_id, msg)
+            result = await client.runs.wait(
                 thread_id,
                 assistant_id,
-                run_config,
-                run_context,
+                input=run_input,
+                config=run_config,
+                context=run_context,
             )
-            return
 
-        logger.info("[Manager] invoking runs.wait(thread_id=%s, text=%r)", thread_id, msg.text[:100])
-        result = await client.runs.wait(
-            thread_id,
-            assistant_id,
-            input={"messages": [{"role": "human", "content": msg.text}]},
-            config=run_config,
-            context=run_context,
-        )
+            response_text = _extract_response_text(result)
+            artifacts = _collect_artifacts(thread_id, result, outputs_snapshot)
 
-        response_text = _extract_response_text(result)
-        artifacts = _extract_artifacts(result)
+            logger.info(
+                "[Manager] agent response received: thread_id=%s, response_len=%d, artifacts=%d",
+                thread_id,
+                len(response_text) if response_text else 0,
+                len(artifacts),
+            )
 
-        logger.info(
-            "[Manager] agent response received: thread_id=%s, response_len=%d, artifacts=%d",
-            thread_id,
-            len(response_text) if response_text else 0,
-            len(artifacts),
-        )
+            response_text, attachments = _prepare_artifact_delivery(thread_id, response_text, artifacts)
 
-        response_text, attachments = _prepare_artifact_delivery(thread_id, response_text, artifacts)
+            if not response_text:
+                if attachments:
+                    response_text = _format_artifact_text([a.virtual_path for a in attachments])
+                else:
+                    response_text = "(No response from agent)"
 
-        if not response_text:
-            if attachments:
-                response_text = _format_artifact_text([a.virtual_path for a in attachments])
-            else:
-                response_text = "(No response from agent)"
-
-        outbound = OutboundMessage(
-            channel_name=msg.channel_name,
-            chat_id=msg.chat_id,
-            thread_id=thread_id,
-            text=response_text,
-            artifacts=artifacts,
-            attachments=attachments,
-            thread_ts=msg.thread_ts,
-        )
-        logger.info("[Manager] publishing outbound message to bus: channel=%s, chat_id=%s", msg.channel_name, msg.chat_id)
-        await self.bus.publish_outbound(outbound)
+            outbound = OutboundMessage(
+                channel_name=msg.channel_name,
+                chat_id=msg.chat_id,
+                thread_id=thread_id,
+                text=response_text,
+                artifacts=artifacts,
+                attachments=attachments,
+                thread_ts=msg.thread_ts,
+            )
+            logger.info("[Manager] publishing outbound message to bus: channel=%s, chat_id=%s", msg.channel_name, msg.chat_id)
+            await self.bus.publish_outbound(outbound)
+        finally:
+            await self._cancel_typing_task(typing_task)
 
     async def _handle_streaming_chat(
         self,
@@ -740,6 +932,8 @@ class ChannelManager:
         assistant_id: str,
         run_config: dict[str, Any],
         run_context: dict[str, Any],
+        run_input: dict[str, Any],
+        outputs_snapshot: Mapping[str, tuple[int, int]] | None,
     ) -> None:
         logger.info("[Manager] invoking runs.stream(thread_id=%s, text=%r)", thread_id, msg.text[:100])
 
@@ -755,7 +949,7 @@ class ChannelManager:
             async for chunk in client.runs.stream(
                 thread_id,
                 assistant_id,
-                input={"messages": [{"role": "human", "content": msg.text}]},
+                input=run_input,
                 config=run_config,
                 context=run_context,
                 stream_mode=["messages-tuple", "values"],
@@ -802,7 +996,7 @@ class ChannelManager:
         finally:
             result = last_values if last_values is not None else {"messages": [{"type": "ai", "content": latest_text}]}
             response_text = _extract_response_text(result)
-            artifacts = _extract_artifacts(result)
+            artifacts = _collect_artifacts(thread_id, result, outputs_snapshot)
             response_text, attachments = _prepare_artifact_delivery(thread_id, response_text, artifacts)
 
             if not response_text:

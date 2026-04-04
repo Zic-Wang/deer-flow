@@ -458,6 +458,61 @@ class TestChannelManager:
 
         _run(go())
 
+    def test_handle_chat_bridges_inbound_files_into_upload_context(self, monkeypatch):
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            mock_client = _make_mock_langgraph_client()
+            manager._client = mock_client
+
+            staged_files = [
+                {
+                    "filename": "photo.png",
+                    "size": 4,
+                    "path": "/mnt/user-data/uploads/photo.png",
+                    "status": "uploaded",
+                }
+            ]
+            stage_mock = AsyncMock(return_value=staged_files)
+            monkeypatch.setattr("app.channels.manager.stage_inbound_files", stage_mock)
+
+            await manager.start()
+
+            inbound = InboundMessage(
+                channel_name="wechat",
+                chat_id="chat1",
+                user_id="user1",
+                text="[image]",
+                files=[{"filename": "photo.png", "path": "C:/tmp/photo.png"}],
+            )
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            thread_id = store.get_thread_id("wechat", "chat1")
+            assert thread_id == "test-thread-123"
+            stage_mock.assert_awaited_once_with(thread_id, inbound.files)
+
+            mock_client.runs.wait.assert_called_once()
+            call_args = mock_client.runs.wait.call_args
+            message = call_args[1]["input"]["messages"][0]
+            assert message["type"] == "human"
+            assert message["content"] == [{"type": "text", "text": "[image]"}]
+            assert message["additional_kwargs"]["files"] == staged_files
+
+        _run(go())
+
     def test_handle_chat_uses_channel_session_overrides(self):
         from app.channels.manager import ChannelManager
 
@@ -503,6 +558,108 @@ class TestChannelManager:
             assert call_args[1]["context"]["thinking_enabled"] is False
             assert call_args[1]["context"]["subagent_enabled"] is True
             assert call_args[1]["context"]["agent_name"] == "mobile-agent"
+
+        _run(go())
+
+    def test_handle_chat_triggers_wechat_typing_and_cancels_after_completion(self):
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            typing_calls: list[tuple[str, str | None]] = []
+            release_wait = asyncio.Event()
+
+            async def delayed_wait(*args, **kwargs):
+                await release_wait.wait()
+                return {
+                    "messages": [
+                        {"type": "human", "content": "hi"},
+                        {"type": "ai", "content": "Hello from agent!"},
+                    ]
+                }
+
+            mock_client = _make_mock_langgraph_client()
+            mock_client.runs.wait = AsyncMock(side_effect=delayed_wait)
+            manager._client = mock_client
+
+            class _WechatStub:
+                config = {"typing_refresh_interval": 0.01}
+
+                async def send_typing(self, chat_id: str, context_token: str | None = None) -> bool:
+                    typing_calls.append((chat_id, context_token))
+                    return True
+
+            manager.register_channel("wechat", _WechatStub())
+
+            await manager.start()
+
+            inbound = InboundMessage(
+                channel_name="wechat",
+                chat_id="wx-user-1",
+                user_id="wx-user-1",
+                text="hi",
+                metadata={"context_token": "ctx-typing"},
+            )
+            await bus.publish_inbound(inbound)
+
+            await _wait_for(lambda: len(typing_calls) >= 1)
+            release_wait.set()
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            final_typing_count = len(typing_calls)
+            await asyncio.sleep(0.05)
+            await manager.stop()
+
+            assert final_typing_count >= 1
+            assert len(typing_calls) == final_typing_count
+            assert outbound_received[0].text == "Hello from agent!"
+
+        _run(go())
+
+    def test_handle_chat_skips_typing_without_context_token(self):
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            typing_calls: list[tuple[str, str | None]] = []
+
+            class _WechatStub:
+                config = {"typing_refresh_interval": 0.01}
+
+                async def send_typing(self, chat_id: str, context_token: str | None = None) -> bool:
+                    typing_calls.append((chat_id, context_token))
+                    return True
+
+            manager.register_channel("wechat", _WechatStub())
+
+            mock_client = _make_mock_langgraph_client()
+            manager._client = mock_client
+
+            await manager.start()
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel_name="wechat",
+                    chat_id="wx-user-1",
+                    user_id="wx-user-1",
+                    text="hi",
+                )
+            )
+            await _wait_for(lambda: mock_client.runs.wait.await_count >= 1)
+            await manager.stop()
+
+            assert typing_calls == []
 
         _run(go())
 
@@ -601,6 +758,53 @@ class TestChannelManager:
 
             mock_client.runs.wait.assert_not_called()
             assert outbound_received[0].text == ("Invalid channel session assistant_id 'bad agent!'. Use 'lead_agent' or a custom agent name containing only letters, digits, and hyphens.")
+
+        _run(go())
+
+    def test_handle_chat_recreates_deleted_thread_mapping(self):
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            store.set_thread_id("wechat", "chat1", "stale-thread", user_id="user1")
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            mock_client = _make_mock_langgraph_client(thread_id="replacement-thread")
+            mock_client.runs.wait = AsyncMock(
+                side_effect=[
+                    Exception("HTTPException: 404: Run not found"),
+                    {
+                        "messages": [
+                            {"type": "human", "content": "hi"},
+                            {"type": "ai", "content": "Recovered on new thread!"},
+                        ]
+                    },
+                ]
+            )
+            manager._client = mock_client
+
+            await manager.start()
+
+            inbound = InboundMessage(channel_name="wechat", chat_id="chat1", user_id="user1", text="hi")
+            await bus.publish_inbound(inbound)
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            assert mock_client.threads.create.call_count == 1
+            assert mock_client.runs.wait.call_count == 2
+            wait_thread_ids = [call.args[0] for call in mock_client.runs.wait.call_args_list]
+            assert wait_thread_ids == ["stale-thread", "replacement-thread"]
+            assert store.get_thread_id("wechat", "chat1") == "replacement-thread"
+            assert outbound_received[0].text == "Recovered on new thread!"
 
         _run(go())
 
@@ -1461,6 +1665,154 @@ class TestHandleChatWithArtifacts:
 
         _run(go())
 
+    def test_infers_artifacts_from_outputs_when_present_files_missing(self, tmp_path):
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            run_result = {
+                "messages": [
+                    {"type": "human", "content": "export data"},
+                    {
+                        "type": "ai",
+                        "content": "",
+                        "tool_calls": [
+                            {"name": "write_file", "args": {"path": "/mnt/user-data/outputs/output.csv", "content": "a,b\n1,2"}},
+                        ],
+                    },
+                    {"type": "tool", "name": "write_file", "content": "OK"},
+                ],
+            }
+            mock_client = _make_mock_langgraph_client(run_result=run_result)
+            manager._client = mock_client
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            outputs_dir = tmp_path / "threads" / "test-thread-123" / "user-data" / "outputs"
+            outputs_dir.mkdir(parents=True)
+
+            def _wait_side_effect(*args, **kwargs):
+                (outputs_dir / "output.csv").write_text("a,b\n1,2", encoding="utf-8")
+                return run_result
+
+            mock_client.runs.wait = AsyncMock(side_effect=_wait_side_effect)
+
+            class _MockPaths:
+                def sandbox_outputs_dir(self, thread_id):
+                    assert thread_id == "test-thread-123"
+                    return outputs_dir
+
+                def resolve_virtual_path(self, thread_id, virtual_path):
+                    assert thread_id == "test-thread-123"
+                    assert virtual_path == "/mnt/user-data/outputs/output.csv"
+                    return outputs_dir / "output.csv"
+
+            with patch("deerflow.config.paths.get_paths", return_value=_MockPaths()):
+                await manager.start()
+                await bus.publish_inbound(
+                    InboundMessage(
+                        channel_name="wechat",
+                        chat_id="c1",
+                        user_id="u1",
+                        text="export data",
+                    )
+                )
+                await _wait_for(lambda: len(outbound_received) >= 1)
+                await manager.stop()
+
+            assert len(outbound_received) == 1
+            assert outbound_received[0].artifacts == ["/mnt/user-data/outputs/output.csv"]
+            assert len(outbound_received[0].attachments) == 1
+            assert outbound_received[0].attachments[0].filename == "output.csv"
+            assert "output.csv" in outbound_received[0].text
+
+        _run(go())
+
+    def test_upload_artifact_is_copied_and_attached_for_channel_delivery(self, tmp_path):
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            run_result = {
+                "messages": [
+                    {"type": "human", "content": "send that image back"},
+                    {
+                        "type": "ai",
+                        "content": "Here is the image.",
+                        "tool_calls": [
+                            {"name": "present_files", "args": {"filepaths": ["/mnt/user-data/uploads/photo.png"]}},
+                        ],
+                    },
+                    {"type": "tool", "name": "present_files", "content": "ok"},
+                ],
+            }
+            mock_client = _make_mock_langgraph_client(run_result=run_result)
+            manager._client = mock_client
+
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            thread_id = "test-thread-123"
+            outputs_dir = tmp_path / "threads" / thread_id / "user-data" / "outputs"
+            uploads_dir = tmp_path / "threads" / thread_id / "user-data" / "uploads"
+            outputs_dir.mkdir(parents=True)
+            uploads_dir.mkdir(parents=True)
+            upload_file = uploads_dir / "photo.png"
+            upload_file.write_bytes(b"png")
+
+            class _MockPaths:
+                def sandbox_outputs_dir(self, incoming_thread_id):
+                    assert incoming_thread_id == thread_id
+                    return outputs_dir
+
+                def sandbox_uploads_dir(self, incoming_thread_id):
+                    assert incoming_thread_id == thread_id
+                    return uploads_dir
+
+                def resolve_virtual_path(self, incoming_thread_id, virtual_path):
+                    assert incoming_thread_id == thread_id
+                    assert virtual_path == "/mnt/user-data/uploads/photo.png"
+                    return upload_file
+
+            with patch("deerflow.config.paths.get_paths", return_value=_MockPaths()):
+                await manager.start()
+                await bus.publish_inbound(
+                    InboundMessage(
+                        channel_name="wechat",
+                        chat_id="c1",
+                        user_id="u1",
+                        text="send that image back",
+                    )
+                )
+                await _wait_for(lambda: len(outbound_received) >= 1)
+                await manager.stop()
+
+            assert len(outbound_received) == 1
+            assert outbound_received[0].artifacts == ["/mnt/user-data/uploads/photo.png"]
+            assert len(outbound_received[0].attachments) == 1
+            attachment = outbound_received[0].attachments[0]
+            assert attachment.virtual_path == "/mnt/user-data/uploads/photo.png"
+            assert attachment.actual_path.parent == outputs_dir
+            assert attachment.actual_path.read_bytes() == b"png"
+            assert attachment.filename == "photo.png"
+
+        _run(go())
+
     def test_only_last_turn_artifacts_returned(self):
         """Only artifacts from the current turn's present_files calls should be included."""
         from app.channels.manager import ChannelManager
@@ -1954,6 +2306,17 @@ class TestChannelService:
 
         assert service.manager._langgraph_url == "http://custom-langgraph:2024"
         assert service.manager._gateway_url == "http://custom-gateway:8001"
+
+    def test_get_status_includes_wechat(self):
+        from app.channels.service import ChannelService
+
+        service = ChannelService(channels_config={"wechat": {"enabled": False}})
+
+        status = service.get_status()
+
+        assert "wechat" in status["channels"]
+        assert status["channels"]["wechat"]["enabled"] is False
+        assert status["channels"]["wechat"]["running"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -698,6 +698,52 @@ checkpointer:
 #     bot_token: $TELEGRAM_BOT_TOKEN
 #     allowed_users: []               # empty = allow all
 #
+#   wechat:
+#     enabled: false
+#     bot_token: $WECHAT_BOT_TOKEN
+#     ilink_bot_id: $WECHAT_ILINK_BOT_ID
+#     # Optional: sent as iLink-App-Id header when provided
+#     ilink_app_id: ""
+#     # Optional: sent as SKRouteTag header when provided
+#     route_tag: ""
+#     allowed_users: []               # empty = allow all
+#     # Optional: long-polling timeout in seconds
+#     polling_timeout: 35
+#     # Optional: respect server-provided longpolling_timeout_ms from getupdates
+#     respect_server_longpoll_timeout: true
+#     # Optional: persist getupdates cursor under the gateway container volume
+#     state_dir: ./.deer-flow/wechat/state
+#     # Optional: max inbound image size in bytes before skipping download
+#     max_inbound_image_bytes: 20971520
+#     # Optional: max outbound image size in bytes before skipping upload
+#     max_outbound_image_bytes: 20971520
+#     # Optional: max inbound file size in bytes before skipping download
+#     max_inbound_file_bytes: 52428800
+#     # Optional: max outbound file size in bytes before skipping upload
+#     max_outbound_file_bytes: 52428800
+#     # Optional: enable final-text chunked reply UX for long responses
+#     chunked_reply_enabled: true
+#     # Optional: minimum reply length before chunking kicks in
+#     chunked_reply_trigger_chars: 800
+#     # Optional: target max chars per chunk
+#     chunked_reply_max_chunk_chars: 500
+#     # Optional: merge tiny chunks smaller than this threshold
+#     chunked_reply_min_chunk_chars: 120
+#     # Optional: cap total chunk count to avoid spam
+#     chunked_reply_max_chunks: 6
+#     # Optional: pause between chunks in seconds
+#     chunked_reply_interval_seconds: 0.8
+#     # Optional: allowed file extensions for regular file receive/send
+#     allowed_file_extensions: [".txt", ".md", ".pdf", ".csv", ".json", ".yaml", ".yml", ".xml", ".html", ".log", ".zip", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".rtf"]
+#     # Optional: allow channel to bind via QR code when bot_token is unavailable/expired
+#     qrcode_login_enabled: false
+#     auto_rebind_on_expired: false
+#     qrcode_poll_interval: 2
+#     qrcode_poll_timeout: 180
+#     qrcode_bot_type: 3
+#     # Optional: enable typing helper methods for future integration
+#     typing_enabled: true
+#
 #     # Optional: channel-level session overrides
 #     session:
 #       assistant_id: mobile-agent  # custom agent names are supported here too

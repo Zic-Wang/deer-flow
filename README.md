@@ -375,6 +375,7 @@ DeerFlow supports receiving tasks from messaging apps. Channels auto-start when 
 | Telegram | Bot API (long-polling) | Easy |
 | Slack | Socket Mode | Moderate |
 | Feishu / Lark | WebSocket | Moderate |
+| WeChat | Tencent iLink (long-polling) | Moderate |
 | WeCom | WebSocket | Moderate |
 
 **Configuration in `config.yaml`:**
@@ -419,6 +420,33 @@ channels:
     bot_token: $TELEGRAM_BOT_TOKEN
     allowed_users: []               # empty = allow all
 
+  wechat:
+    enabled: false
+    bot_token: $WECHAT_BOT_TOKEN
+    ilink_bot_id: $WECHAT_ILINK_BOT_ID
+    allowed_users: []               # empty = allow all
+    polling_timeout: 35
+    state_dir: ./.deer-flow/wechat/state
+    respect_server_longpoll_timeout: true
+    ilink_app_id: ""
+    route_tag: ""
+    qrcode_login_enabled: false
+    auto_rebind_on_expired: false
+    qrcode_poll_interval: 2
+    qrcode_poll_timeout: 180
+    qrcode_bot_type: 3
+    max_inbound_image_bytes: 20971520
+    max_outbound_image_bytes: 20971520
+    max_inbound_file_bytes: 52428800
+    max_outbound_file_bytes: 52428800
+    chunked_reply_enabled: true
+    chunked_reply_trigger_chars: 800
+    chunked_reply_max_chunk_chars: 500
+    chunked_reply_min_chunk_chars: 120
+    chunked_reply_max_chunks: 6
+    chunked_reply_interval_seconds: 0.8
+    typing_enabled: true
+
     # Optional: per-channel / per-user session settings
     session:
       assistant_id: mobile-agent  # custom agent names are also supported here
@@ -452,6 +480,10 @@ SLACK_APP_TOKEN=xapp-...
 FEISHU_APP_ID=cli_xxxx
 FEISHU_APP_SECRET=your_app_secret
 
+# WeChat iLink
+WECHAT_BOT_TOKEN=your_ilink_bot_token
+WECHAT_ILINK_BOT_ID=your_ilink_bot_id
+
 # WeCom
 WECOM_BOT_ID=your_bot_id
 WECOM_BOT_SECRET=your_bot_secret
@@ -476,6 +508,13 @@ WECOM_BOT_SECRET=your_bot_secret
 2. Add permissions: `im:message`, `im:message.p2p_msg:readonly`, `im:resource`.
 3. Under **Events**, subscribe to `im.message.receive_v1` and select **Long Connection** mode.
 4. Copy the App ID and App Secret. Set `FEISHU_APP_ID` and `FEISHU_APP_SECRET` in `.env` and enable the channel in `config.yaml`.
+
+**WeChat Setup**
+
+1. Obtain an iLink `bot_token` through your existing WeChat/iLink binding flow.
+2. Set `WECHAT_BOT_TOKEN` in `.env` and enable the `wechat` channel in `config.yaml`.
+3. For Docker Compose deployments, keep `state_dir` on a persistent volume so the `get_updates_buf` cursor survives restarts.
+4. If you want DeerFlow to self-recover from expired tokens, enable `qrcode_login_enabled` and `auto_rebind_on_expired`; the channel will persist QR/token state under `state_dir`.
 
 **WeCom Setup**
 

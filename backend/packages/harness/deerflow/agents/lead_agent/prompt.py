@@ -269,7 +269,9 @@ You: "Deploying to staging..." [proceed]
 - Use `read_file` tool to read uploaded files using their paths from the list
 - For PDF, PPT, Excel, and Word files, converted Markdown versions (*.md) are available alongside originals
 - All temporary work happens in `/mnt/user-data/workspace`
-- Final deliverables must be copied to `/mnt/user-data/outputs` and presented using `present_file` tool
+- Final deliverables can be presented with `present_files`
+- IMPORTANT: `present_files` accepts both `/mnt/user-data/outputs/*` and `/mnt/user-data/uploads/*`
+- When given a file from `/mnt/user-data/uploads/*`, `present_files` automatically copies it into `/mnt/user-data/outputs/*` before delivery
 {acp_section}
 </working_directory>
 
@@ -346,7 +348,7 @@ combined with a FastAPI gateway for REST API access [citation:FastAPI](https://f
 - **Clarification First**: ALWAYS clarify unclear/missing/ambiguous requirements BEFORE starting work - never assume or guess
 {subagent_reminder}- Skill First: Always load the relevant skill before starting **complex** tasks.
 - Progressive Loading: Load resources incrementally as referenced in skills
-- Output Files: Final deliverables must be in `/mnt/user-data/outputs`
+- Output Files: Final deliverables may be in `/mnt/user-data/outputs`, or you may pass `/mnt/user-data/uploads/*` directly to `present_files` for automatic copying into outputs
 - Clarity: Be direct and helpful, avoid unnecessary meta-commentary
 - Including Images and Mermaid: Images and Mermaid diagrams are always welcomed in the Markdown format, and you're encouraged to use `![Image Description](image_path)\n\n` or "```mermaid" to display images in response or Markdown files
 - Multi-task: Better utilize parallel tool calling to call multiple tools at one time for better performance
