@@ -9,7 +9,6 @@ import hashlib
 import json
 import logging
 import mimetypes
-import re
 import secrets
 import time
 from collections.abc import Mapping
@@ -27,8 +26,6 @@ from app.channels.message_bus import InboundMessageType, MessageBus, OutboundMes
 
 logger = logging.getLogger(__name__)
 
-_SENTENCE_SPLIT_RE = re.compile(r".+?(?:[。！？!?；;]+(?:\s+|$)|\.(?:\s+|$)|\n|$)", re.S)
-
 
 class MessageItemType(IntEnum):
     NONE = 0
@@ -44,11 +41,6 @@ class UploadMediaType(IntEnum):
     VIDEO = 2
     FILE = 3
     VOICE = 4
-
-
-class TypingStatus(IntEnum):
-    TYPING = 1
-    CANCEL = 2
 
 
 def _build_ilink_client_version(version: str) -> str:
@@ -139,10 +131,10 @@ class WechatChannel(Channel):
 
     Configuration keys (in ``config.yaml`` under ``channels.wechat``):
         - ``bot_token``: iLink bot token used for authenticated API calls.
+        - ``qrcode_login_enabled``: (optional) Allow first-time QR bootstrap when ``bot_token`` is missing.
         - ``base_url``: (optional) iLink API base URL.
         - ``allowed_users``: (optional) List of allowed iLink user IDs. Empty = allow all.
         - ``polling_timeout``: (optional) Long-poll timeout in seconds. Default: 35.
-        - ``typing_enabled``: (optional) Enable best-effort typing helper methods.
         - ``state_dir``: (optional) Directory used to persist the long-poll cursor.
     """
 
@@ -162,11 +154,6 @@ class WechatChannel(Channel):
     DEFAULT_MAX_OUTBOUND_IMAGE_BYTES = 20 * 1024 * 1024
     DEFAULT_MAX_INBOUND_FILE_BYTES = 50 * 1024 * 1024
     DEFAULT_MAX_OUTBOUND_FILE_BYTES = 50 * 1024 * 1024
-    DEFAULT_CHUNKED_REPLY_TRIGGER_CHARS = 800
-    DEFAULT_CHUNKED_REPLY_MAX_CHARS = 500
-    DEFAULT_CHUNKED_REPLY_MIN_CHARS = 120
-    DEFAULT_CHUNKED_REPLY_MAX_CHUNKS = 6
-    DEFAULT_CHUNKED_REPLY_INTERVAL_SECONDS = 0.8
     DEFAULT_ALLOWED_FILE_EXTENSIONS = frozenset(
         {
             ".txt",
@@ -242,9 +229,7 @@ class WechatChannel(Channel):
         self._retry_delay = self._coerce_float(config.get("polling_retry_delay"), self.DEFAULT_RETRY_DELAY)
         self._qrcode_poll_interval = self._coerce_float(config.get("qrcode_poll_interval"), self.DEFAULT_QRCODE_POLL_INTERVAL)
         self._qrcode_poll_timeout = self._coerce_float(config.get("qrcode_poll_timeout"), self.DEFAULT_QRCODE_POLL_TIMEOUT)
-        self._typing_enabled = bool(config.get("typing_enabled", True))
         self._qrcode_login_enabled = bool(config.get("qrcode_login_enabled", False))
-        self._auto_rebind_on_expired = bool(config.get("auto_rebind_on_expired", self._qrcode_login_enabled))
         self._qrcode_bot_type = self._coerce_int(config.get("qrcode_bot_type"), self.DEFAULT_QRCODE_BOT_TYPE)
         self._ilink_app_id = str(config.get("ilink_app_id") or "").strip()
         self._route_tag = str(config.get("route_tag") or "").strip()
@@ -253,29 +238,6 @@ class WechatChannel(Channel):
         self._max_outbound_image_bytes = self._coerce_int(config.get("max_outbound_image_bytes"), self.DEFAULT_MAX_OUTBOUND_IMAGE_BYTES)
         self._max_inbound_file_bytes = self._coerce_int(config.get("max_inbound_file_bytes"), self.DEFAULT_MAX_INBOUND_FILE_BYTES)
         self._max_outbound_file_bytes = self._coerce_int(config.get("max_outbound_file_bytes"), self.DEFAULT_MAX_OUTBOUND_FILE_BYTES)
-        self._chunked_reply_enabled = bool(config.get("chunked_reply_enabled", True))
-        self._chunked_reply_trigger_chars = max(
-            0,
-            self._coerce_int(config.get("chunked_reply_trigger_chars"), self.DEFAULT_CHUNKED_REPLY_TRIGGER_CHARS),
-        )
-        self._chunked_reply_max_chars = max(
-            1,
-            self._coerce_int(config.get("chunked_reply_max_chunk_chars"), self.DEFAULT_CHUNKED_REPLY_MAX_CHARS),
-        )
-        self._chunked_reply_min_chars = max(
-            1,
-            self._coerce_int(config.get("chunked_reply_min_chunk_chars"), self.DEFAULT_CHUNKED_REPLY_MIN_CHARS),
-        )
-        self._chunked_reply_max_chunks = max(
-            1,
-            self._coerce_int(config.get("chunked_reply_max_chunks"), self.DEFAULT_CHUNKED_REPLY_MAX_CHUNKS),
-        )
-        self._chunked_reply_interval_seconds = max(
-            0.0,
-            self._coerce_float(
-                config.get("chunked_reply_interval_seconds"), self.DEFAULT_CHUNKED_REPLY_INTERVAL_SECONDS
-            ),
-        )
         self._allowed_file_extensions = self._coerce_str_set(
             config.get("allowed_file_extensions"), self.DEFAULT_ALLOWED_FILE_EXTENSIONS
         )
@@ -344,69 +306,13 @@ class WechatChannel(Channel):
             logger.warning("[WeChat] missing context_token for chat=%s, dropping outbound message", msg.chat_id)
             return
 
-        chunks = self._chunk_reply_text(text)
-        if len(chunks) <= 1:
-            await self._send_text_message(
-                chat_id=msg.chat_id,
-                context_token=context_token,
-                text=text,
-                client_id_prefix="deerflow",
-                max_retries=_max_retries,
-            )
-            return
-
-        logger.info(
-            "[WeChat] chunked reply enabled for chat=%s, chunks=%d, text_len=%d",
-            msg.chat_id,
-            len(chunks),
-            len(text),
+        await self._send_text_message(
+            chat_id=msg.chat_id,
+            context_token=context_token,
+            text=text,
+            client_id_prefix="deerflow",
+            max_retries=_max_retries,
         )
-
-        sent_chunks = 0
-        for index, chunk in enumerate(chunks):
-            try:
-                await self._send_text_message(
-                    chat_id=msg.chat_id,
-                    context_token=context_token,
-                    text=chunk,
-                    client_id_prefix=f"deerflow_chunk_{index + 1}",
-                    max_retries=_max_retries,
-                )
-                sent_chunks += 1
-            except Exception:
-                if sent_chunks == 0:
-                    logger.warning(
-                        "[WeChat] first chunk failed for chat=%s, falling back to single final message",
-                        msg.chat_id,
-                    )
-                    await self._send_text_message(
-                        chat_id=msg.chat_id,
-                        context_token=context_token,
-                        text=text,
-                        client_id_prefix="deerflow_fallback",
-                        max_retries=_max_retries,
-                    )
-                    return
-
-                remainder = "\n\n".join(part for part in chunks[index:] if part.strip()).strip()
-                logger.warning(
-                    "[WeChat] chunked reply interrupted for chat=%s after %d/%d chunks; sending remainder as final chunk",
-                    msg.chat_id,
-                    sent_chunks,
-                    len(chunks),
-                )
-                if remainder:
-                    await self._send_text_message(
-                        chat_id=msg.chat_id,
-                        context_token=context_token,
-                        text=remainder,
-                        client_id_prefix="deerflow_chunk_final",
-                        max_retries=_max_retries,
-                    )
-                return
-
-            if index < len(chunks) - 1 and self._chunked_reply_interval_seconds > 0:
-                await asyncio.sleep(self._chunked_reply_interval_seconds)
 
     async def _send_text_message(
         self,
@@ -456,107 +362,6 @@ class WechatChannel(Channel):
 
         logger.error("[WeChat] send failed after %d attempts: %s", max_retries, last_exc)
         raise last_exc  # type: ignore[misc]
-
-    def _chunk_reply_text(self, text: str) -> list[str]:
-        normalized = text.strip()
-        if not normalized:
-            return []
-        if not self._chunked_reply_enabled:
-            return [normalized]
-        if "```" in normalized:
-            return [normalized]
-        if self._chunked_reply_trigger_chars > 0 and len(normalized) < self._chunked_reply_trigger_chars:
-            return [normalized]
-
-        paragraphs = [paragraph.strip() for paragraph in re.split(r"\n{2,}", normalized) if paragraph.strip()]
-        if not paragraphs:
-            return [normalized]
-
-        chunks: list[str] = []
-        current = ""
-        for paragraph in paragraphs:
-            for paragraph_chunk in self._split_paragraph_chunks(paragraph):
-                candidate = paragraph_chunk if not current else f"{current}\n\n{paragraph_chunk}"
-                if current and len(candidate) > self._chunked_reply_max_chars:
-                    chunks.append(current.strip())
-                    current = paragraph_chunk
-                else:
-                    current = candidate
-
-        if current.strip():
-            chunks.append(current.strip())
-
-        merged_chunks = self._merge_small_chunks(chunks)
-        return merged_chunks or [normalized]
-
-    def _split_paragraph_chunks(self, paragraph: str) -> list[str]:
-        chunks: list[str] = []
-        current = ""
-        raw_units = [match.group(0).strip() for match in _SENTENCE_SPLIT_RE.finditer(paragraph) if match.group(0).strip()]
-        units = raw_units or [paragraph.strip()]
-
-        normalized_units: list[str] = []
-        for unit in units:
-            if len(unit) <= self._chunked_reply_max_chars:
-                normalized_units.append(unit)
-            else:
-                normalized_units.extend(self._hard_wrap_text(unit))
-
-        for unit in normalized_units:
-            separator = " " if current else ""
-            candidate = f"{current}{separator}{unit}" if current else unit
-            if current and len(candidate) > self._chunked_reply_max_chars:
-                chunks.append(current.strip())
-                current = unit
-            else:
-                current = candidate
-
-        if current.strip():
-            chunks.append(current.strip())
-        return chunks or [paragraph.strip()]
-
-    def _hard_wrap_text(self, text: str) -> list[str]:
-        wrapped: list[str] = []
-        remaining = text.strip()
-        while len(remaining) > self._chunked_reply_max_chars:
-            split_at = remaining.rfind("\n", 0, self._chunked_reply_max_chars + 1)
-            if split_at <= self._chunked_reply_min_chars:
-                split_at = remaining.rfind(" ", 0, self._chunked_reply_max_chars + 1)
-            if split_at <= self._chunked_reply_min_chars:
-                split_at = self._chunked_reply_max_chars
-
-            piece = remaining[:split_at].strip()
-            if not piece:
-                piece = remaining[: self._chunked_reply_max_chars].strip() or remaining[: self._chunked_reply_max_chars]
-                split_at = len(piece)
-
-            wrapped.append(piece)
-            remaining = remaining[split_at:].strip()
-
-        if remaining:
-            wrapped.append(remaining)
-        return wrapped
-
-    def _merge_small_chunks(self, chunks: list[str]) -> list[str]:
-        if len(chunks) <= 1:
-            return chunks
-
-        merged: list[str] = []
-        for chunk in chunks:
-            if merged and len(chunk) < self._chunked_reply_min_chars:
-                merged[-1] = f"{merged[-1]}\n\n{chunk}".strip()
-            else:
-                merged.append(chunk)
-
-        if len(merged) > 1 and len(merged[-1]) < self._chunked_reply_min_chars:
-            merged[-2] = f"{merged[-2]}\n\n{merged[-1]}".strip()
-            merged.pop()
-
-        while len(merged) > self._chunked_reply_max_chunks:
-            merged[-2] = f"{merged[-2]}\n\n{merged[-1]}".strip()
-            merged.pop()
-
-        return merged
 
     async def send_file(self, msg: OutboundMessage, attachment: ResolvedAttachment) -> bool:
         if attachment.is_image:
@@ -739,34 +544,6 @@ class WechatChannel(Channel):
             logger.exception("[WeChat] failed to send file attachment %s", attachment.filename)
             return False
 
-    async def send_typing(self, chat_id: str, context_token: str | None = None) -> bool:
-        """Best-effort typing helper reserved for later manager integration."""
-        if not self._typing_enabled:
-            return False
-
-        resolved_context = (context_token or self._context_tokens_by_chat.get(chat_id) or "").strip()
-        if not resolved_context:
-            return False
-
-        try:
-            ticket = await self._get_typing_ticket(chat_id, resolved_context)
-            if not ticket:
-                return False
-            data = await self._request_json(
-                "/ilink/bot/sendtyping",
-                {
-                    "ilink_user_id": chat_id,
-                    "typing_ticket": ticket,
-                        "status": int(TypingStatus.TYPING),
-                    "base_info": self._base_info(),
-                },
-            )
-            self._ensure_success(data, "sendtyping")
-            return True
-        except Exception:
-            logger.exception("[WeChat] failed to send typing for chat=%s", chat_id)
-            return False
-
     async def _poll_loop(self) -> None:
         while self._running:
             try:
@@ -787,10 +564,13 @@ class WechatChannel(Channel):
                 if ret not in (0, None):
                     errcode = data.get("errcode")
                     if errcode == -14:
-                        logger.warning("[WeChat] bot token expired, attempting lifecycle recovery")
-                        await self._handle_token_expired()
-                        await asyncio.sleep(self._retry_delay)
-                        continue
+                        self._bot_token = ""
+                        self._get_updates_buf = ""
+                        self._save_state()
+                        self._save_auth_state(status="expired", bot_token="")
+                        logger.error("[WeChat] bot token expired; scan again or update bot_token and restart the channel")
+                        self._running = False
+                        break
                     logger.warning(
                         "[WeChat] getupdates returned ret=%s errcode=%s errmsg=%s",
                         ret,
@@ -855,31 +635,17 @@ class WechatChannel(Channel):
         inbound.topic_id = None
         await self.bus.publish_inbound(inbound)
 
-    async def _get_typing_ticket(self, chat_id: str, context_token: str) -> str | None:
-        data = await self._request_json(
-            "/ilink/bot/getconfig",
-            {
-                "ilink_user_id": chat_id,
-                "context_token": context_token,
-                "base_info": self._base_info(),
-            },
-        )
-        self._ensure_success(data, "getconfig")
-        ticket = data.get("typing_ticket")
-        return ticket if isinstance(ticket, str) and ticket else None
-
-    async def _ensure_authenticated(self, *, force_rebind: bool = False) -> bool:
+    async def _ensure_authenticated(self) -> bool:
         async with self._auth_lock:
-            if self._bot_token and not force_rebind:
+            if self._bot_token:
                 return True
 
-            if not force_rebind and not self._bot_token:
-                self._load_auth_state()
-                if self._bot_token:
-                    return True
+            self._load_auth_state()
+            if self._bot_token:
+                return True
 
             if not self._qrcode_login_enabled:
-                return bool(self._bot_token)
+                return False
 
             try:
                 auth_state = await self._bind_via_qrcode()
@@ -887,17 +653,6 @@ class WechatChannel(Channel):
                 logger.exception("[WeChat] QR code binding failed")
                 return False
             return bool(auth_state.get("bot_token"))
-
-    async def _handle_token_expired(self) -> bool:
-        self._bot_token = ""
-        self._get_updates_buf = ""
-        self._save_state()
-        self._save_auth_state(status="expired")
-
-        if not self._auto_rebind_on_expired:
-            return False
-
-        return await self._ensure_authenticated(force_rebind=True)
 
     async def _bind_via_qrcode(self) -> dict[str, Any]:
         qrcode_data = await self._request_public_get_json(
@@ -935,14 +690,13 @@ class WechatChannel(Channel):
                 if ilink_bot_id:
                     self._ilink_bot_id = ilink_bot_id
 
-                auth_state = self._save_auth_state(
+                return self._save_auth_state(
                     status="confirmed",
                     bot_token=token,
                     ilink_bot_id=self._ilink_bot_id,
                     qrcode=qrcode,
                     qrcode_img_content=qrcode_img_content or None,
                 )
-                return auth_state
 
             if status in {"expired", "canceled", "cancelled", "invalid", "failed"}:
                 self._save_auth_state(
@@ -1247,6 +1001,7 @@ class WechatChannel(Channel):
 
         mime_type = detected_image[1] if detected_image else mimetypes.guess_type(filename)[0] or "image/jpeg"
         return {
+            "type": "image",
             "filename": stored_path.name,
             "size": len(decrypted),
             "path": str(stored_path),
@@ -1296,6 +1051,7 @@ class WechatChannel(Channel):
             return None
 
         return {
+            "type": "file",
             "filename": stored_path.name,
             "size": len(decrypted),
             "path": str(stored_path),

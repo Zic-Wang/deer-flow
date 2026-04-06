@@ -424,28 +424,14 @@ channels:
     enabled: false
     bot_token: $WECHAT_BOT_TOKEN
     ilink_bot_id: $WECHAT_ILINK_BOT_ID
+    qrcode_login_enabled: true      # optional: allow first-time QR bootstrap when bot_token is absent
     allowed_users: []               # empty = allow all
     polling_timeout: 35
     state_dir: ./.deer-flow/wechat/state
-    respect_server_longpoll_timeout: true
-    ilink_app_id: ""
-    route_tag: ""
-    qrcode_login_enabled: false
-    auto_rebind_on_expired: false
-    qrcode_poll_interval: 2
-    qrcode_poll_timeout: 180
-    qrcode_bot_type: 3
     max_inbound_image_bytes: 20971520
     max_outbound_image_bytes: 20971520
     max_inbound_file_bytes: 52428800
     max_outbound_file_bytes: 52428800
-    chunked_reply_enabled: true
-    chunked_reply_trigger_chars: 800
-    chunked_reply_max_chunk_chars: 500
-    chunked_reply_min_chunk_chars: 120
-    chunked_reply_max_chunks: 6
-    chunked_reply_interval_seconds: 0.8
-    typing_enabled: true
 
     # Optional: per-channel / per-user session settings
     session:
@@ -511,10 +497,11 @@ WECOM_BOT_SECRET=your_bot_secret
 
 **WeChat Setup**
 
-1. Obtain an iLink `bot_token` through your existing WeChat/iLink binding flow.
-2. Set `WECHAT_BOT_TOKEN` in `.env` and enable the `wechat` channel in `config.yaml`.
-3. For Docker Compose deployments, keep `state_dir` on a persistent volume so the `get_updates_buf` cursor survives restarts.
-4. If you want DeerFlow to self-recover from expired tokens, enable `qrcode_login_enabled` and `auto_rebind_on_expired`; the channel will persist QR/token state under `state_dir`.
+1. Enable the `wechat` channel in `config.yaml`.
+2. Either set `WECHAT_BOT_TOKEN` in `.env`, or set `qrcode_login_enabled: true` for first-time QR bootstrap.
+3. When `bot_token` is absent and QR bootstrap is enabled, watch backend logs for the QR content returned by iLink and complete the binding flow.
+4. After the QR flow succeeds, DeerFlow persists the acquired token under `state_dir` for later restarts.
+5. For Docker Compose deployments, keep `state_dir` on a persistent volume so the `get_updates_buf` cursor and saved auth state survive restarts.
 
 **WeCom Setup**
 
