@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from deerflow.config.paths import Paths
-
 from app.channels.inbound_uploads import stage_inbound_files
+from deerflow.config.paths import Paths
 
 
 class _SandboxStub:

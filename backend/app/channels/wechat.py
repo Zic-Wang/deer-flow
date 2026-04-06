@@ -12,10 +12,11 @@ import mimetypes
 import re
 import secrets
 import time
-from urllib.parse import quote
+from collections.abc import Mapping
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
+from urllib.parse import quote
 
 import httpx
 from cryptography.hazmat.primitives import padding

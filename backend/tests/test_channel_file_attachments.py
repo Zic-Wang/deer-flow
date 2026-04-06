@@ -173,17 +173,43 @@ class TestResolveAttachments:
 
         assert result == []
 
-    def test_rejects_uploads_path(self):
-        """Paths under /mnt/user-data/uploads/ are rejected (security)."""
+    def test_resolves_uploads_path_by_copying_into_outputs(self, tmp_path):
+        """Paths under /mnt/user-data/uploads/ are copied into outputs for delivery."""
         from app.channels.manager import _resolve_attachments
 
-        mock_paths = MagicMock()
+        thread_id = "t1"
+        outputs_dir = tmp_path / "threads" / thread_id / "user-data" / "outputs"
+        uploads_dir = tmp_path / "threads" / thread_id / "user-data" / "uploads"
+        outputs_dir.mkdir(parents=True)
+        uploads_dir.mkdir(parents=True)
 
-        with patch("deerflow.config.paths.get_paths", return_value=mock_paths):
-            result = _resolve_attachments("t1", ["/mnt/user-data/uploads/secret.pdf"])
+        upload_file = uploads_dir / "secret.pdf"
+        upload_file.write_bytes(b"%PDF-1.4 secret")
 
-        assert result == []
-        mock_paths.resolve_virtual_path.assert_not_called()
+        class _MockPaths:
+            def sandbox_outputs_dir(self, incoming_thread_id):
+                assert incoming_thread_id == thread_id
+                return outputs_dir
+
+            def sandbox_uploads_dir(self, incoming_thread_id):
+                assert incoming_thread_id == thread_id
+                return uploads_dir
+
+            def resolve_virtual_path(self, incoming_thread_id, virtual_path):
+                assert incoming_thread_id == thread_id
+                assert virtual_path == "/mnt/user-data/uploads/secret.pdf"
+                return upload_file
+
+        with patch("deerflow.config.paths.get_paths", return_value=_MockPaths()):
+            result = _resolve_attachments(thread_id, ["/mnt/user-data/uploads/secret.pdf"])
+
+        assert len(result) == 1
+        attachment = result[0]
+        assert attachment.virtual_path == "/mnt/user-data/uploads/secret.pdf"
+        assert attachment.actual_path.parent == outputs_dir
+        assert attachment.actual_path.read_bytes() == b"%PDF-1.4 secret"
+        assert attachment.filename == "secret.pdf"
+        assert attachment.mime_type == "application/pdf"
 
     def test_rejects_workspace_path(self):
         """Paths under /mnt/user-data/workspace/ are rejected (security)."""

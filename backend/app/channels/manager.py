@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 import httpx
-from langgraph_sdk.errors import ConflictError
+from langgraph_sdk.errors import ConflictError, NotFoundError
 
 from app.channels.commands import KNOWN_CHANNEL_COMMANDS
 from app.channels.inbound_uploads import stage_inbound_files
@@ -95,6 +95,20 @@ def _is_thread_busy_error(exc: BaseException | None) -> bool:
     if isinstance(exc, ConflictError):
         return True
     return "already running a task" in str(exc)
+
+
+def _is_thread_not_found_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    if isinstance(exc, NotFoundError):
+        return True
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 404:
+        return True
+
+    message = str(exc).lower()
+    return "404" in message and ("run not found" in message or "thread not found" in message)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -841,6 +855,18 @@ class ChannelManager:
         logger.info("[Manager] new thread created on LangGraph Server: thread_id=%s for chat_id=%s topic_id=%s", thread_id, msg.chat_id, msg.topic_id)
         return thread_id
 
+    async def _recreate_missing_thread(self, client, msg: InboundMessage, stale_thread_id: str) -> str:
+        """Replace a stale thread mapping after the LangGraph server reports it missing."""
+        removed = self.store.remove(msg.channel_name, msg.chat_id, topic_id=msg.topic_id)
+        logger.warning(
+            "[Manager] stale thread mapping detected; recreating thread: old_thread_id=%s removed=%s chat_id=%s topic_id=%s",
+            stale_thread_id,
+            removed,
+            msg.chat_id,
+            msg.topic_id,
+        )
+        return await self._create_thread(client, msg)
+
     async def _handle_chat(self, msg: InboundMessage, extra_context: dict[str, Any] | None = None) -> None:
         client = self._get_client()
 
@@ -855,42 +881,56 @@ class ChannelManager:
         if thread_id is None:
             thread_id = await self._create_thread(client, msg)
 
-        outputs_snapshot = _snapshot_outputs_dir(thread_id)
-
         typing_task = self._create_typing_task(msg)
+        original_text = msg.text
+        retried_missing_thread = False
 
         try:
-            assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
-            if extra_context:
-                run_context.update(extra_context)
+            while True:
+                outputs_snapshot = _snapshot_outputs_dir(thread_id)
 
-            uploaded = await _ingest_inbound_files(thread_id, msg)
-            if uploaded:
-                msg.text = f"{_format_uploaded_files_block(uploaded)}\n\n{msg.text}".strip()
+                assistant_id, run_config, run_context = self._resolve_run_params(msg, thread_id)
+                if extra_context:
+                    run_context.update(extra_context)
 
-            if self._channel_supports_streaming(msg.channel_name):
+                uploaded = await _ingest_inbound_files(thread_id, msg)
+                if uploaded:
+                    msg.text = f"{_format_uploaded_files_block(uploaded)}\n\n{original_text}".strip()
+                else:
+                    msg.text = original_text
+
+                if self._channel_supports_streaming(msg.channel_name):
+                    run_input = await _build_run_input(thread_id, msg)
+                    await self._handle_streaming_chat(
+                        client,
+                        msg,
+                        thread_id,
+                        assistant_id,
+                        run_config,
+                        run_context,
+                        run_input,
+                        outputs_snapshot,
+                    )
+                    return
+
+                logger.info("[Manager] invoking runs.wait(thread_id=%s, text=%r)", thread_id, msg.text[:100])
                 run_input = await _build_run_input(thread_id, msg)
-                await self._handle_streaming_chat(
-                    client,
-                    msg,
-                    thread_id,
-                    assistant_id,
-                    run_config,
-                    run_context,
-                    run_input,
-                    outputs_snapshot,
-                )
-                return
-
-            logger.info("[Manager] invoking runs.wait(thread_id=%s, text=%r)", thread_id, msg.text[:100])
-            run_input = await _build_run_input(thread_id, msg)
-            result = await client.runs.wait(
-                thread_id,
-                assistant_id,
-                input=run_input,
-                config=run_config,
-                context=run_context,
-            )
+                try:
+                    result = await client.runs.wait(
+                        thread_id,
+                        assistant_id,
+                        input=run_input,
+                        config=run_config,
+                        context=run_context,
+                    )
+                except Exception as exc:
+                    msg.text = original_text
+                    if not retried_missing_thread and _is_thread_not_found_error(exc):
+                        thread_id = await self._recreate_missing_thread(client, msg, thread_id)
+                        retried_missing_thread = True
+                        continue
+                    raise
+                break
 
             response_text = _extract_response_text(result)
             artifacts = _collect_artifacts(thread_id, result, outputs_snapshot)
@@ -922,6 +962,7 @@ class ChannelManager:
             logger.info("[Manager] publishing outbound message to bus: channel=%s, chat_id=%s", msg.channel_name, msg.chat_id)
             await self.bus.publish_outbound(outbound)
         finally:
+            msg.text = original_text
             await self._cancel_typing_task(typing_task)
 
     async def _handle_streaming_chat(
