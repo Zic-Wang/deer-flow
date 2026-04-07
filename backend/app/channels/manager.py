@@ -7,8 +7,8 @@ import logging
 import mimetypes
 import re
 import time
-from pathlib import Path
 from collections.abc import Awaitable, Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
