@@ -844,23 +844,22 @@ class WechatChannel(Channel):
         thumb_plaintext: bytes | None = None,
         no_need_thumb: bool = False,
     ) -> dict[str, Any]:
-        encrypted = _encrypt_aes_128_ecb(plaintext, aes_key)
+        _validate_aes_128_key(aes_key)
         payload: dict[str, Any] = {
             "filekey": filekey,
             "media_type": int(media_type),
             "to_user_id": to_user_id,
             "rawsize": len(plaintext),
             "rawfilemd5": _md5_hex(plaintext),
-            "filesize": len(encrypted),
+            "filesize": _encrypted_size_for_aes_128_ecb(len(plaintext)),
             "aeskey": aes_key.hex(),
         }
         if thumb_plaintext is not None:
-            thumb_encrypted = _encrypt_aes_128_ecb(thumb_plaintext, aes_key)
             payload.update(
                 {
                     "thumb_rawsize": len(thumb_plaintext),
                     "thumb_rawfilemd5": _md5_hex(thumb_plaintext),
-                    "thumb_filesize": len(thumb_encrypted),
+                    "thumb_filesize": _encrypted_size_for_aes_128_ecb(len(thumb_plaintext)),
                 }
             )
         elif no_need_thumb:
