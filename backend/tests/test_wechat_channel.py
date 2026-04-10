@@ -1251,5 +1251,3 @@ def test_qrcode_login_binds_and_persists_auth_state(monkeypatch, tmp_path: Path)
         assert auth_state["ilink_bot_id"] == "bot-99"
 
     _run(go())
-
-

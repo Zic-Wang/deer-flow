@@ -238,9 +238,7 @@ class WechatChannel(Channel):
         self._max_outbound_image_bytes = self._coerce_int(config.get("max_outbound_image_bytes"), self.DEFAULT_MAX_OUTBOUND_IMAGE_BYTES)
         self._max_inbound_file_bytes = self._coerce_int(config.get("max_inbound_file_bytes"), self.DEFAULT_MAX_INBOUND_FILE_BYTES)
         self._max_outbound_file_bytes = self._coerce_int(config.get("max_outbound_file_bytes"), self.DEFAULT_MAX_OUTBOUND_FILE_BYTES)
-        self._allowed_file_extensions = self._coerce_str_set(
-            config.get("allowed_file_extensions"), self.DEFAULT_ALLOWED_FILE_EXTENSIONS
-        )
+        self._allowed_file_extensions = self._coerce_str_set(config.get("allowed_file_extensions"), self.DEFAULT_ALLOWED_FILE_EXTENSIONS)
         self._allowed_users: set[str] = {str(uid).strip() for uid in config.get("allowed_users", []) if str(uid).strip()}
         self._bot_token = str(config.get("bot_token") or "").strip()
         self._ilink_bot_id = str(config.get("ilink_bot_id") or "").strip() or None
@@ -1368,9 +1366,5 @@ class WechatChannel(Channel):
     def _coerce_str_set(value: Any, default: frozenset[str]) -> set[str]:
         if not isinstance(value, (list, tuple, set, frozenset)):
             return set(default)
-        normalized = {
-            str(item).strip().lower() if str(item).strip().startswith(".") else f".{str(item).strip().lower()}"
-            for item in value
-            if str(item).strip()
-        }
+        normalized = {str(item).strip().lower() if str(item).strip().startswith(".") else f".{str(item).strip().lower()}" for item in value if str(item).strip()}
         return normalized or set(default)
