@@ -84,7 +84,7 @@ async def _read_wechat_inbound_file(file_info: dict[str, Any], client: httpx.Asy
     raw_path = file_info.get("path")
     if isinstance(raw_path, str) and raw_path.strip():
         try:
-            return Path(raw_path).read_bytes()
+            return await asyncio.to_thread(Path(raw_path).read_bytes)
         except OSError:
             logger.exception("[Manager] failed to read WeChat inbound file from local path: %s", raw_path)
             return None
